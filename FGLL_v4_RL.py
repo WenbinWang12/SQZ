@@ -1,4 +1,4 @@
-# FG_vs_BP_CartPole_aligned.py
+# FG_vs_BP_CartPole_SPSA_aligned_epsgreedy_CI_adamparity_fixed_eval_batchmean.py
 import os
 import math
 import time
@@ -43,21 +43,28 @@ print(f"使用设备: {device}")
 # =========================
 ENV_ID = "CartPole-v1"
 GAMMA = 0.99
-MAX_UPDATES = 60           # 参数更新的次数（两种方法相同）
-UPD_EPISODES = 10          # ☆ 对齐：每次“更新”消耗的 episode 数
-EVAL_EVERY = 2             # 每多少次更新打印一次日志（post-update 验证）
+MAX_UPDATES = 200            # 参数更新的次数（两种方法相同）
+UPD_EPISODES = 10           # ☆ 对齐：每次“更新”消耗的 episode 数（两侧一致且固定）
+EVAL_EVERY = 2              # 每多少次更新打印一次日志（post-update 验证）
+EPS_EVAL = 0.1             # ☆ 评估用 ε-greedy（两侧一致）
 
-# —— Forward-Gradient (FG) —— #
-# 2*ROLL_OUTS_FG (+ 可选1次新θ评估) ≈ UPD_EPISODES
-ROLL_OUTS_FG = max(1, UPD_EPISODES // 2)   # 中心差分成对方向数
-EPS_PERTURB = 0.02
-LR_FG = 0.03
+# —— 优化器公平性：两侧都用 Adam —— #
+LR_ADAM = 3e-2            # ☆ 两侧相同学习率
+ADAM_BETAS = (0.9, 0.999)
+ADAM_EPS = 1e-8
 
-# —— REINFORCE (BP, 批量版) —— #
-LR_BP = 3e-3
-ENTROPY_COEF = 1e-3
+
+# —— 前向学习（SPSA） —— #
+assert UPD_EPISODES >= 2, "UPD_EPISODES 必须 >= 2"
+if UPD_EPISODES % 2 != 0:
+    print("[警告] 为严格对齐预算，UPD_EPISODES 应为偶数。将忽略最后 1 条轨迹。")
+K_SPSA = UPD_EPISODES // 2  # 每次更新用 K 个 SPSA 方向（2K 条轨迹）
+EPS_PERTURB = 0.02          # SPSA 扰动尺度
+
+# —— REINFORCE（反向传播） —— #
 GRAD_CLIP = 1.0
-BATCH_EPISODES = UPD_EPISODES              # ☆ 对齐：每次更新的轨迹数
+BATCH_EPISODES = UPD_EPISODES  # ☆ 对齐：每次更新的轨迹数
+ENTROPY_COEF = 0.0             # ☆ 置 0，避免额外正则差异
 
 # 其他
 HIDDEN_SIZES = (128, 128)
@@ -180,7 +187,7 @@ class PolicyNet(nn.Module):
 
 
 # =========================
-# 参数向量化（FG 用）
+# 参数向量化（SPSA 用）
 # =========================
 def get_param_vector(model: nn.Module):
     return torch.cat([p.data.view(-1) for p in model.parameters()])
@@ -194,7 +201,7 @@ def set_param_vector(model: nn.Module, theta_vec: torch.Tensor):
 
 
 # =========================
-# 环境交互
+# 环境交互（训练时）
 # =========================
 @torch.no_grad()
 def rollout_return(env, policy: PolicyNet, greedy=False, reward_clip=REWARD_CLIP, seed=None):
@@ -206,87 +213,139 @@ def rollout_return(env, policy: PolicyNet, greedy=False, reward_clip=REWARD_CLIP
     while not done:
         a = policy.act_greedy(obs) if greedy else policy.act_sample(obs)
         obs, r, done = step_env(env, a)
-        if reward_clip is not None:
-            r = max(min(r, reward_clip), -reward_clip)
+        if REWARD_CLIP is not None:
+            r = max(min(r, REWARD_CLIP), -REWARD_CLIP)
         total_r += r
     return total_r
 
 
 # =========================
-# 统一评估（贪心 + 固定验证种子）
+# 统一评估：ε-greedy（本地 RNG，可复现）+ 固定验证种子
 # =========================
 @torch.no_grad()
-def evaluate(env, policy, seeds=VAL_SEEDS):
+def evaluate_eps_greedy(env, policy, seeds=VAL_SEEDS, eps=EPS_EVAL):
+    """
+    评估策略：以概率 eps 采取随机动作（本地 rng 生成，按 seed 可复现），否则采取贪心 argmax。
+    返回：均值、标准差
+    """
     scores = []
+
+    act_dim = getattr(env.action_space, "n", None)
+
     for sd in seeds:
-        scores.append(rollout_return(env, policy, greedy=True, seed=sd))
+        obs = reset_env(env, seed=sd)
+        rng = np.random.default_rng(sd)  # 本地 rng，每个种子独立、可复现
+        done = False
+        total_r = 0.0
+
+        while not done:
+            explore = (rng.random() < eps)
+            if explore:
+                if act_dim is not None:
+                    a = int(rng.integers(low=0, high=act_dim))
+                else:
+                    a = env.action_space.sample()
+            else:
+                logits = policy(torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0))
+                a = int(torch.argmax(logits, dim=-1).item())
+
+            obs, r, done = step_env(env, a)
+            if REWARD_CLIP is not None:
+                r = max(min(r, REWARD_CLIP), -REWARD_CLIP)
+            total_r += r
+
+        scores.append(total_r)
+
     return float(np.mean(scores)), float(np.std(scores))
 
 
 # =========================
-# Forward-Gradient 训练（无 BP），对齐样本预算 + post-update 验证
+# 前向学习（SPSA+Adam）训练：无 BP；样本预算对齐 + post-update 验证
+# 左图训练指标：使用本次更新的 2K 条评估回报的“batch 均值”（不额外消耗样本预算）
 # =========================
-def train_forward_gradient(env_train, env_val, policy: PolicyNet,
-                           updates=MAX_UPDATES, eps=EPS_PERTURB, lr=LR_FG,
-                           rollouts=ROLL_OUTS_FG):
+def train_spsa(env_train, env_val, policy: PolicyNet,
+               updates=MAX_UPDATES, eps=EPS_PERTURB, lr=LR_ADAM, K=K_SPSA):
     theta = get_param_vector(policy).to(device)
-    dim = theta.numel()
-    train_returns = []   # 记录每次更新后，用新θ在训练环境上的一次采样回报（可选）
-    val_means = []       # 记录每次更新后的贪心验证均值
+
+    # ---- Adam 状态（与 BP 完全同参）----
+    m = torch.zeros_like(theta)
+    v = torch.zeros_like(theta)
+    b1, b2 = ADAM_BETAS
+    eps_adam = ADAM_EPS
+    t_step = 0
+
+    train_returns = []   # 这里记录“本轮 2K 评估回报的均值”，用于左图
+    val_means = []       # 每次更新后的 ε-greedy 验证均值（右图）
+    val_stds  = []       # 每次更新后的 验证标准差（右图）
 
     best_theta = theta.clone()
     best_val = -1e9
 
     for up in range(1, updates + 1):
-        # ----- 梯度估计：中心差分的成对方向 -----
+        # ----- SPSA 梯度估计 + 收集本轮的 2K 回报 -----
         g_est = torch.zeros_like(theta)
-        for k in range(rollouts):
-            v = torch.randn(dim, device=device)
-            v = v / (v.norm() + 1e-8)
+        batch_eval_returns = []  # 收集 J_plus/J_minus 以统计 batch 均值
 
-            set_param_vector(policy, theta + eps * v)
-            J_plus = rollout_return(env_train, policy, greedy=False, seed=SEED + 20000 + up * 10 + k)
+        for k in range(K):
+            delta = torch.randint_like(theta, low=0, high=2, device=device, dtype=torch.long)
+            delta = delta.float().mul_(2.0).sub_(1.0)   # {0,1}->{-1,+1}
 
-            set_param_vector(policy, theta - eps * v)
-            J_minus = rollout_return(env_train, policy, greedy=False, seed=SEED + 30000 + up * 10 + k)
+            set_param_vector(policy, theta + eps * delta)
+            J_plus = rollout_return(env_train, policy, greedy=False,
+                                    seed=SEED + 120000 + up * 1000 + k)
+            batch_eval_returns.append(J_plus)
 
-            g_est += ((J_plus - J_minus) / (2.0 * eps)) * v
+            set_param_vector(policy, theta - eps * delta)
+            J_minus = rollout_return(env_train, policy, greedy=False,
+                                     seed=SEED + 130000 + up * 1000 + k)
+            batch_eval_returns.append(J_minus)
 
-        g_est /= rollouts
+            g_est += ((J_plus - J_minus) / (2.0 * eps)) * delta
 
-        # ----- 梯度上升 -----
-        theta = theta + lr * g_est
+        g_est /= max(1, K)
+
+        # ----- Adam 梯度上升（与 BP 同超参）-----
+        t_step += 1
+        m = b1 * m + (1.0 - b1) * g_est
+        v = b2 * v + (1.0 - b2) * (g_est * g_est)
+        m_hat = m / (1.0 - b1 ** t_step)
+        v_hat = v / (1.0 - b2 ** t_step)
+        theta = theta + lr * m_hat / (torch.sqrt(v_hat) + eps_adam)
+
         set_param_vector(policy, theta)
 
-        # （可选）记录一次训练分布下的随机采样回报
-        J_new = rollout_return(env_train, policy, greedy=False, seed=SEED + 40000 + up)
-        train_returns.append(J_new)
+        # 左图训练指标：使用本轮 2K 回报的 batch 均值（不额外采样）
+        train_returns.append(float(np.mean(batch_eval_returns)))
 
-        # ----- post-update 验证（贪心 + 固定验证种子）-----
-        val_mean, _ = evaluate(env_val, policy, seeds=VAL_SEEDS)
+        # ----- post-update 验证（ε-greedy + 固定验证种子）-----
+        val_mean, val_std = evaluate_eps_greedy(env_val, policy, seeds=VAL_SEEDS, eps=EPS_EVAL)
         val_means.append(val_mean)
+        val_stds.append(val_std)
 
         if val_mean > best_val:
             best_val = val_mean
             best_theta = theta.clone()
 
         if up % EVAL_EVERY == 0 or up == 1:
-            print(f"[FG] Update {up:3d} | train_return(sampled): {J_new:6.1f} | VAL(greedy): {val_mean:6.1f}")
+            print(f"[SPSA+Adam] Update {up:3d} | batch_mean_return: {train_returns[-1]:6.1f} "
+                  f"| VAL(eps={EPS_EVAL:.2f}): {val_mean:6.1f} ± {val_std:5.1f}")
 
     # 恢复最好参数
     set_param_vector(policy, best_theta)
-    return train_returns, val_means, best_theta
+    return train_returns, val_means, val_stds, best_theta
 
 
 # =========================
-# 批量版 REINFORCE（带 baseline）+ 对齐样本预算 + post-update 验证
+# 批量版 REINFORCE（Adam；带 baseline；无熵正则）+ 对齐样本预算 + post-update 验证
+# 左图训练指标：batch 内各轨迹回报的均值（与之前一致）
 # =========================
 def train_backprop_reinforce(env_train, env_val, policy: PolicyNet,
                              updates=MAX_UPDATES, batch_episodes=BATCH_EPISODES,
-                             lr=LR_BP, gamma=GAMMA, entropy_coef=ENTROPY_COEF):
-    optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
-    train_returns = []  # 记录 batch 内各轨迹均值（用于观察）
-    val_means = []      # 记录每次更新后的贪心验证均值
+                             lr=LR_ADAM, gamma=GAMMA, entropy_coef=ENTROPY_COEF):
+    optimizer = torch.optim.Adam(policy.parameters(), lr=lr, betas=ADAM_BETAS, eps=ADAM_EPS)
+    train_returns = []  # 记录 batch 内各轨迹均值（用于左图）
+    val_means = []      # 每次更新后的 ε-greedy 验证均值（右图）
+    val_stds  = []      # 每次更新后的 验证标准差（右图）
 
     best_state = copy.deepcopy(policy.state_dict())
     best_val = -1e9
@@ -298,7 +357,7 @@ def train_backprop_reinforce(env_train, env_val, policy: PolicyNet,
 
         # ===== 收集一个 batch（对齐样本预算）=====
         for i in range(batch_episodes):
-            obs = reset_env(env_train, seed=SEED + 50000 + ep_counter)
+            obs = reset_env(env_train, seed=SEED + 200000 + ep_counter)
             ep_counter += 1
             logps, entrs, rewards = [], [], []
             done = False
@@ -334,7 +393,7 @@ def train_backprop_reinforce(env_train, env_val, policy: PolicyNet,
             adv_cat = (adv_cat - adv_cat.mean()) / (adv_cat.std() + 1e-8)
 
         loss_pg = -(logps_cat * adv_cat).mean()
-        loss_ent = -entropy_coef * ent_cat.mean()
+        loss_ent = -entropy_coef * ent_cat.mean() if entropy_coef != 0.0 else 0.0
         loss = loss_pg + loss_ent
 
         optimizer.zero_grad()
@@ -342,23 +401,25 @@ def train_backprop_reinforce(env_train, env_val, policy: PolicyNet,
         torch.nn.utils.clip_grad_norm_(policy.parameters(), GRAD_CLIP)
         optimizer.step()
 
-        # batch 的训练均值（供参考）
+        # 左图训练指标：batch 回报均值
         train_returns.append(float(np.mean(batch_returns)))
 
-        # ===== post-update 验证（贪心 + 固定验证种子）=====
+        # ===== post-update 验证（ε-greedy + 固定验证种子）=====
         with torch.no_grad():
-            val_mean, _ = evaluate(env_val, policy, seeds=VAL_SEEDS)
+            val_mean, val_std = evaluate_eps_greedy(env_val, policy, seeds=VAL_SEEDS, eps=EPS_EVAL)
         val_means.append(val_mean)
+        val_stds.append(val_std)
 
         if val_mean > best_val:
             best_val = val_mean
             best_state = copy.deepcopy(policy.state_dict())
 
         if up % EVAL_EVERY == 0 or up == 1:
-            print(f"[BP] Update {up:3d} | batch_mean_return: {np.mean(batch_returns):6.1f} | VAL(greedy): {val_mean:6.1f}")
+            print(f"[BP(Adam)]  Update {up:3d} | batch_mean_return: {train_returns[-1]:6.1f} "
+                  f"| VAL(eps={EPS_EVAL:.2f}): {val_mean:6.1f} ± {val_std:5.1f}")
 
     policy.load_state_dict(best_state)
-    return train_returns, val_means
+    return train_returns, val_means, val_stds
 
 
 # =========================
@@ -366,75 +427,91 @@ def train_backprop_reinforce(env_train, env_val, policy: PolicyNet,
 # =========================
 def main():
     # 训练与验证环境（分离，避免状态干扰）
-    env_fg_train = make_env(ENV_ID, seed=SEED)
-    env_bp_train = make_env(ENV_ID, seed=SEED + 1)
-    env_val = make_env(ENV_ID, seed=SEED + 2)  # 供两种方法共享的验证环境
+    env_spsa_train = make_env(ENV_ID, seed=SEED)
+    env_bp_train   = make_env(ENV_ID, seed=SEED + 1)
+    env_val        = make_env(ENV_ID, seed=SEED + 2)  # 供两种方法共享的验证环境
 
-    obs_dim = env_fg_train.observation_space.shape[0]
-    act_dim = env_fg_train.action_space.n
+    obs_dim = env_spsa_train.observation_space.shape[0]
+    act_dim = env_spsa_train.action_space.n
 
     # 相同初始化的两份策略（公平对比）
     base_policy = PolicyNet(obs_dim, act_dim).to(device)
-    fg_policy = copy.deepcopy(base_policy).to(device)
-    bp_policy = copy.deepcopy(base_policy).to(device)
+    spsa_policy = copy.deepcopy(base_policy).to(device)
+    bp_policy   = copy.deepcopy(base_policy).to(device)
 
-    print("\n=== 训练：Forward-Gradient（无 Backprop；样本预算对齐）===")
-    fg_train_ret, fg_val_means, best_theta = train_forward_gradient(
-        env_fg_train, env_val, fg_policy,
-        updates=MAX_UPDATES, eps=EPS_PERTURB, lr=LR_FG, rollouts=ROLL_OUTS_FG
+    print("\n=== 训练：SPSA + Adam（无 Backprop；样本预算对齐；左图=2K评估均值）===")
+    spsa_train_ret, spsa_val_means, spsa_val_stds, best_theta = train_spsa(
+        env_spsa_train, env_val, spsa_policy,
+        updates=MAX_UPDATES, eps=EPS_PERTURB, lr=LR_ADAM, K=K_SPSA
     )
 
-    print("\n=== 训练：REINFORCE（批量；带 Backprop；样本预算对齐）===")
-    bp_train_ret, bp_val_means = train_backprop_reinforce(
+    print("\n=== 训练：REINFORCE + Adam（带 Backprop；样本预算对齐；左图=batch均值）===")
+    bp_train_ret, bp_val_means, bp_val_stds = train_backprop_reinforce(
         env_bp_train, env_val, bp_policy,
         updates=MAX_UPDATES, batch_episodes=BATCH_EPISODES,
-        lr=LR_BP, gamma=GAMMA, entropy_coef=ENTROPY_COEF
+        lr=LR_ADAM, gamma=GAMMA, entropy_coef=ENTROPY_COEF
     )
 
-    # 末尾最终评估（与训练期间相同的验证规则：贪心 + VAL_SEEDS）
-    final_fg_mean, final_fg_std = evaluate(env_val, fg_policy, seeds=VAL_SEEDS)
-    final_bp_mean, final_bp_std = evaluate(env_val, bp_policy, seeds=VAL_SEEDS)
+    # 末尾最终评估（与训练期间相同的验证规则：ε-greedy + VAL_SEEDS）
+    final_spsa_mean, final_spsa_std = evaluate_eps_greedy(env_val, spsa_policy, seeds=VAL_SEEDS, eps=EPS_EVAL)
+    final_bp_mean,   final_bp_std   = evaluate_eps_greedy(env_val, bp_policy,   seeds=VAL_SEEDS, eps=EPS_EVAL)
 
-    print("\n最终评估（贪心，固定验证种子集）:")
-    print(f"  Forward-Gradient : {final_fg_mean:.2f} ± {final_fg_std:.2f}")
-    print(f"  REINFORCE (BP)   : {final_bp_mean:.2f} ± {final_bp_std:.2f}")
+    print("\n最终评估（ε-greedy，固定验证种子集）:")
+    print(f"  SPSA+Adam (Forward) : {final_spsa_mean:.2f} ± {final_spsa_std:.2f}")
+    print(f"  REINFORCE+Adam (BP) : {final_bp_mean:.2f} ± {final_bp_std:.2f}")
 
-    # 绘图（训练指标 & post-update 验证）
+    # 绘图（训练指标 & post-update 验证 with CI）
     plt.figure(figsize=(12, 5))
 
-    # 左：训练指标
+    # 左：训练指标（两侧均为“当前更新所用样本的 batch 均值”）
     plt.subplot(1, 2, 1)
-    x_fg = np.arange(1, len(fg_train_ret) + 1)
+    x_fg = np.arange(1, len(spsa_train_ret) + 1)
     x_bp = np.arange(1, len(bp_train_ret) + 1)
-    plt.plot(x_fg, fg_train_ret, alpha=0.3, label='FG train (sampled)')
-    plt.plot(x_fg, moving_average(fg_train_ret), label='FG train EMA')
-    plt.plot(x_bp, bp_train_ret, alpha=0.3, label='BP train (batch mean)')
-    plt.plot(x_bp, moving_average(bp_train_ret), label='BP train EMA')
+    plt.plot(x_fg, spsa_train_ret, alpha=0.3, label='SPSA+Adam train (2K eval mean)')
+    plt.plot(x_fg, moving_average(spsa_train_ret), label='SPSA+Adam train EMA')
+    plt.plot(x_bp, bp_train_ret, alpha=0.3, label='BP(Adam) train (batch mean)')
+    plt.plot(x_bp, moving_average(bp_train_ret), label='BP(Adam) train EMA')
     plt.xlabel("Update #")
     plt.ylabel("Return")
-    plt.title("Training metrics (not comparable across methods, only trend)")
+    plt.title("Training metrics (both are batch means)")
     plt.legend()
 
-    # 右：对齐的 post-update 验证（可横向比较）
+    # 右：对齐的 post-update 验证（均值 + 95% CI 阴影）
     plt.subplot(1, 2, 2)
-    x1 = np.arange(1, len(fg_val_means) + 1)
+    x1 = np.arange(1, len(spsa_val_means) + 1)
     x2 = np.arange(1, len(bp_val_means) + 1)
-    plt.plot(x1, fg_val_means, label='FG VAL (greedy)')
-    plt.plot(x2, bp_val_means, label='BP VAL (greedy)')
+
+    n_val = max(1, len(VAL_SEEDS))
+    spsa_ci = 1.96 * (np.array(spsa_val_stds) / math.sqrt(n_val))
+    bp_ci   = 1.96 * (np.array(bp_val_stds)   / math.sqrt(n_val))
+
+    plt.plot(x1, spsa_val_means, label=f'SPSA+Adam VAL (eps={EPS_EVAL:.2f})')
+    plt.fill_between(x1,
+                     np.array(spsa_val_means) - spsa_ci,
+                     np.array(spsa_val_means) + spsa_ci,
+                     alpha=0.2)
+
+    plt.plot(x2, bp_val_means, label=f'BP(Adam) VAL (eps={EPS_EVAL:.2f})')
+    plt.fill_between(x2,
+                     np.array(bp_val_means) - bp_ci,
+                     np.array(bp_val_means) + bp_ci,
+                     alpha=0.2)
+
     plt.xlabel("Update #")
-    plt.ylabel("Greedy Return (fixed seeds)")
-    plt.title("Aligned post-update validation")
+    plt.ylabel("Eps-greedy Return (fixed seeds)")
+    plt.title("Aligned post-update validation (mean ± 95% CI)")
     plt.legend()
 
     plt.tight_layout()
-    plt.savefig("rl_fg_vs_bp_aligned.png", dpi=150)
+    plt.savefig("rl_spsa_vs_bp_aligned_epsgreedy_ci_adamparity_fixed_eval_batchmean.png", dpi=150)
     plt.show()
 
     # 保存
-    torch.save(best_theta.detach().cpu(), "fg_best_theta.pt")
-    torch.save(fg_policy.state_dict(), "policy_fg.pt")
+    torch.save(best_theta.detach().cpu(), "spsa_best_theta.pt")
+    torch.save(spsa_policy.state_dict(), "policy_spsa.pt")
     torch.save(bp_policy.state_dict(), "policy_bp.pt")
-    print("\n已保存：fg_best_theta.pt, policy_fg.pt, policy_bp.pt, rl_fg_vs_bp_aligned.png")
+    print("\n已保存：spsa_best_theta.pt, policy_spsa.pt, policy_bp.pt, "
+          "rl_spsa_vs_bp_aligned_epsgreedy_ci_adamparity_fixed_eval_batchmean.png")
 
 
 if __name__ == "__main__":

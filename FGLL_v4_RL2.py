@@ -1,4 +1,3 @@
-# fg_bp_cartpole_gridsearch.py
 import os
 import math
 import csv
@@ -43,13 +42,13 @@ print(f"[Info] 使用设备: {device}")
 # =========================
 # 全局对齐设置 & 超参数（硬对齐）
 # =========================
-ENV_ID = "CartPole-v1"
+ENV_ID = "LunarLander-v2"  # 更复杂的环境
 GAMMA = 0.99
-MAX_UPDATES = 60             # 两侧一致
-UPD_EPISODES = 10            # 两侧一致：每次更新消耗的轨迹数
-EVAL_EVERY = 2               # 打印频率
+MAX_UPDATES = 100            # 增加更新次数
+UPD_EPISODES = 20            # 增加每次更新消耗的轨迹数
+EVAL_EVERY = 5               # 打印频率
 REWARD_CLIP = None
-HIDDEN_SIZES = (128, 128)
+HIDDEN_SIZES = (256, 256, 128)  # 更深的隐藏层
 MOVING_AVG_W = 0.95
 VAL_SEEDS = list(range(90001, 90011))  # 固定验证种子
 STEADY_K = 5                 # 评分时取尾部 K 次验证均值
@@ -58,8 +57,8 @@ STEADY_K = 5                 # 评分时取尾部 K 次验证均值
 # “软对齐”搜索空间（可按需扩/缩）
 # =========================
 # —— SPSA（forward learning）
-SPSA_LR_GRID = [0.00018, 0.000185, 0.00019, 0.000195, 0.0002]
-SPSA_EPS_GRID = [0.04, 0.041, 0.042, 0.043, 0.044, 0.045]
+SPSA_LR_GRID = [0.0001, 0.00015, 0.0002, 0.00025, 0.0003]
+SPSA_EPS_GRID = [0.05, 0.06, 0.07, 0.08, 0.09]
 # K 由 UPD_EPISODES 决定（每方向两次评估，严格对齐预算）
 assert UPD_EPISODES >= 2, "UPD_EPISODES 必须 >= 2"
 if UPD_EPISODES % 2 != 0:
@@ -67,8 +66,45 @@ if UPD_EPISODES % 2 != 0:
 K_SPSA = UPD_EPISODES // 2
 
 # —— REINFORCE（backprop）
-BP_LR_GRID = [0.009, 0.0095, 0.01, 0.011, 0.012]
-BP_ENTROPY_GRID = [0.0006, 0.00065, 0.0007, 0.00075, 0.0008]   # 如需“纯”REINFORCE，可只留 [0.0]
+BP_LR_GRID = [0.005, 0.01, 0.015, 0.02, 0.025]
+BP_ENTROPY_GRID = [0.0001, 0.0002, 0.0003, 0.0004, 0.0005]
+
+# =========================
+# 策略网络（更深的网络）
+# =========================
+class PolicyNet(nn.Module):
+    def __init__(self, obs_dim, act_dim, hidden_sizes=HIDDEN_SIZES):
+        super().__init__()
+        layers, last = [], obs_dim
+        for h in hidden_sizes:
+            layers += [nn.Linear(last, h), nn.ReLU(inplace=True)]
+            last = h
+        layers += [nn.Linear(last, act_dim)]
+        self.net = nn.Sequential(*layers)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+                if m.bias is not None:
+                    fan_in, _ = nn.init._calculate_fan_in_and_fan_out(m.weight)
+                    bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                    nn.init.uniform_(m.bias, -bound, bound)
+
+    def forward(self, x):
+        return self.net(x)
+
+    @torch.no_grad()
+    def act_sample(self, obs):
+        logits = self.forward(torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0))
+        dist = torch.distributions.Categorical(logits=logits)
+        return int(dist.sample().item())
+
+    @torch.no_grad()
+    def act_greedy(self, obs):
+        logits = self.forward(torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0))
+        return int(torch.argmax(logits, dim=-1).item())
 
 # =========================
 # 工具：种子/环境/绘图
@@ -137,58 +173,14 @@ def moving_average(xs, w=MOVING_AVG_W):
     return out
 
 # =========================
-# 策略网络
+# 策略训练与评估（与前文一致）
 # =========================
-class PolicyNet(nn.Module):
-    def __init__(self, obs_dim, act_dim, hidden_sizes=HIDDEN_SIZES):
-        super().__init__()
-        layers, last = [], obs_dim
-        for h in hidden_sizes:
-            layers += [nn.Linear(last, h), nn.ReLU(inplace=True)]
-            last = h
-        layers += [nn.Linear(last, act_dim)]
-        self.net = nn.Sequential(*layers)
-        self._init_weights()
+def evaluate(env, policy, seeds=VAL_SEEDS):
+    scores = []
+    for sd in seeds:
+        scores.append(rollout_return(env, policy, greedy=True, seed=sd))
+    return float(np.mean(scores)), float(np.std(scores))
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
-                if m.bias is not None:
-                    fan_in, _ = nn.init._calculate_fan_in_and_fan_out(m.weight)
-                    bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-                    nn.init.uniform_(m.bias, -bound, bound)
-
-    def forward(self, x):
-        return self.net(x)
-
-    @torch.no_grad()
-    def act_sample(self, obs):
-        logits = self.forward(torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0))
-        dist = torch.distributions.Categorical(logits=logits)
-        return int(dist.sample().item())
-
-    @torch.no_grad()
-    def act_greedy(self, obs):
-        logits = self.forward(torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0))
-        return int(torch.argmax(logits, dim=-1).item())
-
-# =========================
-# 参数向量化（SPSA）
-# =========================
-def get_param_vector(model: nn.Module):
-    return torch.cat([p.data.view(-1) for p in model.parameters()])
-
-def set_param_vector(model: nn.Module, theta_vec: torch.Tensor):
-    idx = 0
-    for p in model.parameters():
-        n = p.numel()
-        p.data.copy_(theta_vec[idx:idx+n].view_as(p))
-        idx += n
-
-# =========================
-# 交互与评估
-# =========================
 @torch.no_grad()
 def rollout_return(env, policy: PolicyNet, greedy=False, reward_clip=REWARD_CLIP, seed=None):
     if seed is not None:
@@ -203,16 +195,6 @@ def rollout_return(env, policy: PolicyNet, greedy=False, reward_clip=REWARD_CLIP
         total_r += r
     return total_r
 
-@torch.no_grad()
-def evaluate(env, policy, seeds=VAL_SEEDS):
-    scores = []
-    for sd in seeds:
-        scores.append(rollout_return(env, policy, greedy=True, seed=sd))
-    return float(np.mean(scores)), float(np.std(scores))
-
-# =========================
-# 训练：SPSA（forward learning）
-# =========================
 def train_spsa(env_train, env_val, policy: PolicyNet,
                updates=MAX_UPDATES, eps=0.02, lr=0.03, K=K_SPSA):
     theta = get_param_vector(policy).to(device)
@@ -222,7 +204,6 @@ def train_spsa(env_train, env_val, policy: PolicyNet,
     for up in range(1, updates + 1):
         g_est = torch.zeros_like(theta)
         for k in range(K):
-            # Rademacher 向量 {-1, +1}
             delta = torch.randint_like(theta, low=0, high=2, device=device, dtype=torch.long)
             delta = delta.float().mul_(2.0).sub_(1.0)
 
@@ -255,9 +236,6 @@ def train_spsa(env_train, env_val, policy: PolicyNet,
     set_param_vector(policy, best_theta)
     return train_returns, val_means, best_theta
 
-# =========================
-# 训练：REINFORCE（backprop）
-# =========================
 def train_backprop_reinforce(env_train, env_val, policy: PolicyNet,
                              updates=MAX_UPDATES, batch_episodes=UPD_EPISODES,
                              lr=3e-3, gamma=GAMMA, entropy_coef=0.0):
@@ -329,52 +307,15 @@ def train_backprop_reinforce(env_train, env_val, policy: PolicyNet,
     return train_returns, val_means
 
 # =========================
-# 实验/搜索封装
-# =========================
-def run_one_spsa_trial(base_policy, env_seed_tuple, lr_spsa, eps):
-    """返回 (score, train_curve, val_curve, best_theta, policy_state_dict)"""
-    # 每个 trial 使用相同的环境种子（保证可比）
-    env_train = make_env(ENV_ID, seed=env_seed_tuple[0])
-    env_val   = make_env(ENV_ID, seed=env_seed_tuple[1])
-
-    policy = copy.deepcopy(base_policy).to(device)
-    train_ret, val_means, best_theta = train_spsa(
-        env_train, env_val, policy,
-        updates=MAX_UPDATES, eps=eps, lr=lr_spsa, K=K_SPSA
-    )
-    # 评分：末尾 STEADY_K 次验证均值
-    k = min(STEADY_K, len(val_means))
-    score = float(np.mean(val_means[-k:])) if k > 0 else float(np.mean(val_means))
-    return score, train_ret, val_means, best_theta, copy.deepcopy(policy.state_dict())
-
-def run_one_bp_trial(base_policy, env_seed_tuple, lr_bp, entropy_coef):
-    """返回 (score, train_curve, val_curve, policy_state_dict)"""
-    env_train = make_env(ENV_ID, seed=env_seed_tuple[0])
-    env_val   = make_env(ENV_ID, seed=env_seed_tuple[1])
-
-    policy = copy.deepcopy(base_policy).to(device)
-    train_ret, val_means = train_backprop_reinforce(
-        env_train, env_val, policy,
-        updates=MAX_UPDATES, batch_episodes=UPD_EPISODES,
-        lr=lr_bp, gamma=GAMMA, entropy_coef=entropy_coef
-    )
-    k = min(STEADY_K, len(val_means))
-    score = float(np.mean(val_means[-k:])) if k > 0 else float(np.mean(val_means))
-    return score, train_ret, val_means, copy.deepcopy(policy.state_dict())
-
-# =========================
 # 主流程：独立网格搜索 + 最优对比
 # =========================
 def main():
-    # 统一基础网络 & 评估环境种子（两侧 trial 内部环境种子固定）
+    # 使用相同基础网络和评估环境种子
     env_seed_tuple_spsa = (SEED + 10, SEED + 20)
     env_seed_tuple_bp   = (SEED + 11, SEED + 21)
 
-    # 用同一基础初始化确保公平
-    # 注：两个方法搜索互不干扰，各自拷贝同一个 base 权重开始
-    # 再次设置全局种子，确保 base_policy 初始化可复现
+    # 基础网络初始化
     set_global_seed(SEED)
-    # 用真实环境一次性获取维度
     tmp_env = make_env(ENV_ID, seed=SEED + 999)
     obs_dim = tmp_env.observation_space.shape[0]
     act_dim = tmp_env.action_space.n
@@ -440,11 +381,9 @@ def main():
           f"score={best_bp['score']:.2f}")
 
     # ========== 最优模型最终评估与对比 ==========
-    # 重新构建评估环境（与搜索阶段一致）
     env_val_spsa = make_env(ENV_ID, seed=env_seed_tuple_spsa[1])
     env_val_bp   = make_env(ENV_ID, seed=env_seed_tuple_bp[1])
 
-    # 还原最优策略权重
     spsa_policy_best = PolicyNet(obs_dim, act_dim).to(device)
     spsa_policy_best.load_state_dict(best_spsa["state_dict"])
     bp_policy_best = PolicyNet(obs_dim, act_dim).to(device)
@@ -459,7 +398,7 @@ def main():
     print(f"  REINFORCE (BP) : {final_bp_mean:.2f} ± {final_bp_std:.2f} "
           f"(lr={best_bp['lr']:.5g}, entropy_coef={best_bp['entropy']:.1e})")
 
-    # ========== 绘图（最优曲线） ==========
+    # 绘图部分
     plt.figure(figsize=(12, 5))
     # 左：训练趋势
     plt.subplot(1, 2, 1)
@@ -490,12 +429,10 @@ def main():
     plt.show()
 
     # ========== 保存成果 ==========
-    # 模型与参数
     torch.save(best_spsa["best_theta"], f"spsa_best_theta_{tag}.pt")
     torch.save(best_spsa["state_dict"], f"policy_spsa_best_{tag}.pt")
     torch.save(best_bp["state_dict"],   f"policy_bp_best_{tag}.pt")
 
-    # 搜索结果 CSV
     with open(f"spsa_grid_{tag}.csv", "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["lr_spsa", "eps", "score_steady_avg", "final_val"])
