@@ -306,6 +306,50 @@ def train_backprop_reinforce(env_train, env_val, policy: PolicyNet,
     policy.load_state_dict(best_state)
     return train_returns, val_means
 
+
+def run_one_spsa_trial(base_policy, env_seed_tuple, lr_spsa, eps):
+    """返回 (score, train_curve, val_curve, best_theta, policy_state_dict)"""
+    # 每个 trial 使用相同的环境种子（保证可比）
+    env_train = make_env(ENV_ID, seed=env_seed_tuple[0])
+    env_val   = make_env(ENV_ID, seed=env_seed_tuple[1])
+
+    policy = copy.deepcopy(base_policy).to(device)
+    train_ret, val_means, best_theta = train_spsa(
+        env_train, env_val, policy,
+        updates=MAX_UPDATES, eps=eps, lr=lr_spsa, K=K_SPSA
+    )
+    # 评分：末尾 STEADY_K 次验证均值
+    k = min(STEADY_K, len(val_means))
+    score = float(np.mean(val_means[-k:])) if k > 0 else float(np.mean(val_means))
+    return score, train_ret, val_means, best_theta, copy.deepcopy(policy.state_dict())
+
+
+def run_one_bp_trial(base_policy, env_seed_tuple, lr_bp, entropy_coef):
+    """返回 (score, train_curve, val_curve, policy_state_dict)"""
+    env_train = make_env(ENV_ID, seed=env_seed_tuple[0])
+    env_val   = make_env(ENV_ID, seed=env_seed_tuple[1])
+
+    policy = copy.deepcopy(base_policy).to(device)
+    train_ret, val_means = train_backprop_reinforce(
+        env_train, env_val, policy,
+        updates=MAX_UPDATES, batch_episodes=UPD_EPISODES,
+        lr=lr_bp, gamma=GAMMA, entropy_coef=entropy_coef
+    )
+    k = min(STEADY_K, len(val_means))
+    score = float(np.mean(val_means[-k:])) if k > 0 else float(np.mean(val_means))
+    return score, train_ret, val_means, copy.deepcopy(policy.state_dict())
+
+
+def get_param_vector(model: nn.Module):
+    return torch.cat([p.data.view(-1) for p in model.parameters()])
+
+def set_param_vector(model: nn.Module, theta_vec: torch.Tensor):
+    idx = 0
+    for p in model.parameters():
+        n = p.numel()
+        p.data.copy_(theta_vec[idx:idx+n].view_as(p))
+        idx += n
+
 # =========================
 # 主流程：独立网格搜索 + 最优对比
 # =========================
