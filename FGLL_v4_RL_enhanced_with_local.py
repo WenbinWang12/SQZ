@@ -48,7 +48,7 @@ GAMMA = 0.99
 MAX_UPDATES = 60             # 两侧一致
 UPD_EPISODES = 10            # 两侧一致：每次更新消耗的轨迹数
 EVAL_EVERY = 2               # 打印频率
-REWARD_CLIP = None
+REWARD_CLIP = None           # 如需更稳，可设为 5
 HIDDEN_SIZES = (128, 128)
 MOVING_AVG_W = 0.95
 VAL_SEEDS = list(range(90001, 90011))  # 固定验证种子
@@ -58,8 +58,8 @@ STEADY_K = 5                 # 评分时取尾部 K 次验证均值
 # “软对齐”搜索空间（可按需扩/缩）
 # =========================
 # —— Forward Learning（原 SPSA 的 eps / lr；我们仍然用黑盒扰动估计，但目标已包含 local loss）
-FL_LR_GRID = [0.00018, 0.00019, 0.000195, 0.0002]   # 原 SPSA_LR_GRID
-FL_EPS_GRID = [0.041, 0.042, 0.043, 0.044]          # 原 SPSA_EPS_GRID
+FL_LR_GRID = [0.00018, 0.00019, 0.000195, 0.0002]
+FL_EPS_GRID = [0.041, 0.042, 0.043, 0.044]
 assert UPD_EPISODES >= 2, "UPD_EPISODES 必须 >= 2"
 if UPD_EPISODES % 2 != 0:
     print("[警告] 为严格对齐预算，UPD_EPISODES 应为偶数。将忽略最后 1 条轨迹。")
@@ -81,6 +81,14 @@ LOCAL_LOSS_CFG = {
     "ent_target": {"weight": 0.02, "target": 0.65} # 策略熵目标（越接近越好）
 }
 GLOBAL_REWARD_WEIGHT = 1.0  # w_R
+
+def is_cfg_enabled(cfg: dict):
+    if cfg is None:
+        return False
+    for k, v in cfg.items():
+        if isinstance(v, dict) and v.get("weight", 0.0) != 0.0:
+            return True
+    return False
 
 # =========================
 # 工具：种子/环境/绘图
@@ -161,7 +169,7 @@ class PolicyNet(nn.Module):
         layers += [nn.Linear(last, act_dim)]
         self.net = nn.Sequential(*layers)
         self._init_weights()
-        self.act_dim = act_dim  # ### NEW: 供熵上限等计算使用
+        self.act_dim = act_dim  # 供熵上限等计算使用
 
     def _init_weights(self):
         for m in self.modules():
@@ -177,7 +185,7 @@ class PolicyNet(nn.Module):
 
     @torch.no_grad()
     def _forward_with_acts(self, x):
-        """### NEW: 前向并记录每个隐藏层激活（ReLU 之后）"""
+        """前向并记录每个隐藏层激活（ReLU 之后）"""
         acts = []
         out = x
         i = 0
@@ -196,17 +204,22 @@ class PolicyNet(nn.Module):
                 out = layer(out)
             i += 1
         logits = out
-        return logits, acts  # acts: list[Tensor(batch=1, H)]
+        return logits, acts
 
     @torch.no_grad()
     def act_sample(self, obs):
         logits = self.forward(torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0))
+        # 相对平移不改变 softmax，增稳；再做温和兜底
+        logits = logits - torch.amax(logits, dim=-1, keepdim=True)
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e6, neginf=-1e6)
         dist = torch.distributions.Categorical(logits=logits)
         return int(dist.sample().item())
 
     @torch.no_grad()
     def act_greedy(self, obs):
         logits = self.forward(torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0))
+        logits = logits - torch.amax(logits, dim=-1, keepdim=True)
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e6, neginf=-1e6)
         return int(torch.argmax(logits, dim=-1).item())
 
 # =========================
@@ -229,10 +242,10 @@ def set_param_vector(model: nn.Module, theta_vec: torch.Tensor):
 def rollout_metrics(env, policy: PolicyNet, greedy=False, reward_clip=REWARD_CLIP, seed=None,
                     need_local=True):
     """
-    ### NEW: 同一条轨迹同时收集：
+    同一条轨迹同时收集：
       - total return
-      - 每步 logits 的熵
-      - 每层激活的时间序列（用于 local losses）
+      - 每步 logits 的熵（通过 logits_arr）
+      - 每层激活的时间序列（acts_traces）
     """
     if seed is not None:
         set_global_seed(seed)
@@ -244,13 +257,17 @@ def rollout_metrics(env, policy: PolicyNet, greedy=False, reward_clip=REWARD_CLI
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
         if need_local:
             logits, acts = policy._forward_with_acts(obs_t)
-            # 收集激活
             if not layer_act_traces:
                 layer_act_traces = [[] for _ in acts]
             for li, a in enumerate(acts):
                 layer_act_traces[li].append(a.squeeze(0).detach().cpu().numpy())
         else:
             logits = policy(obs_t)
+
+        # 相对平移与兜底，避免极端数值
+        logits = logits - torch.amax(logits, dim=-1, keepdim=True)
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e6, neginf=-1e6)
+
         logits_list.append(logits.detach().cpu().numpy())
         dist = torch.distributions.Categorical(logits=logits)
         a = dist.sample() if not greedy else torch.argmax(logits, dim=-1)
@@ -259,11 +276,10 @@ def rollout_metrics(env, policy: PolicyNet, greedy=False, reward_clip=REWARD_CLI
             r = max(min(r, reward_clip), -reward_clip)
         total_r += r
 
-    # 整理本轨迹的 local 所需数据
     if not need_local:
         return total_r, None, None
     logits_arr = np.concatenate(logits_list, axis=0)  # (T, act_dim)
-    acts_traces = [np.stack(tr, axis=0) for tr in layer_act_traces]  # each (T, H)
+    acts_traces = [np.stack(tr, axis=0) for tr in layer_act_traces] if layer_act_traces else []
     return total_r, logits_arr, acts_traces
 
 def _loss_act_l2(acts_traces):
@@ -301,39 +317,42 @@ def _loss_slowness(acts_traces):
 def _loss_entropy_target(logits_arr, target):
     if logits_arr is None:
         return 0.0
-    # categorical entropy（以 nats 为单位）
-    # dist = softmax(logits); H = -sum p log p
-    # 为数值稳定，使用 logsumexp
-    def softmax_entropy(logits):
-        lse = np.log(np.sum(np.exp(logits - np.max(logits)), axis=-1, keepdims=True)) + np.max(logits, axis=-1, keepdims=True)
-        logp = logits - lse
-        p = np.exp(logp)
-        H = -np.sum(p * logp, axis=-1)
-        return H
-    Hs = softmax_entropy(logits_arr)  # (T,)
-    H_bar = float(np.mean(Hs))
-    return (H_bar - float(target))**2
+    # 逐行稳定的 log-sum-exp：
+    # logsumexp(x) = m + log(sum(exp(x - m))), 其中 m = max_i x_i（沿动作维）
+    logits = logits_arr.astype(np.float64, copy=False)
+    m = np.max(logits, axis=-1, keepdims=True)                                  # (T,1)
+    logsumexp = m + np.log(np.sum(np.exp(logits - m), axis=-1, keepdims=True))  # (T,1)
+    logp = logits - logsumexp                                                   # (T,A)
+    p = np.exp(logp)
+    H = -np.sum(p * logp, axis=-1)                                              # (T,)
+    H_bar = float(np.mean(H))
+    return (H_bar - float(target)) ** 2
 
 def compute_local_losses(logits_arr, acts_traces, cfg: dict):
-    """### NEW: 返回 (loss_dict, weighted_sum)"""
+    """返回 (loss_dict, weighted_sum)。cfg=None 时返回 0。自动屏蔽非有限值。"""
+    if cfg is None:
+        return {}, 0.0
     losses = {}
     total = 0.0
     # act_l2
     w = cfg.get("act_l2", {}).get("weight", 0.0)
     if w != 0.0:
         val = _loss_act_l2(acts_traces)
+        if not np.isfinite(val): val = 0.0
         losses["act_l2"] = val
         total += w * val
     # decor
     w = cfg.get("decor", {}).get("weight", 0.0)
     if w != 0.0:
         val = _loss_decorrelation(acts_traces)
+        if not np.isfinite(val): val = 0.0
         losses["decor"] = val
         total += w * val
     # slow
     w = cfg.get("slow", {}).get("weight", 0.0)
     if w != 0.0:
         val = _loss_slowness(acts_traces)
+        if not np.isfinite(val): val = 0.0
         losses["slow"] = val
         total += w * val
     # entropy target
@@ -342,6 +361,7 @@ def compute_local_losses(logits_arr, acts_traces, cfg: dict):
     if w != 0.0:
         tgt = ent_cfg.get("target", 0.0)
         val = _loss_entropy_target(logits_arr, tgt)
+        if not np.isfinite(val): val = 0.0
         losses["ent_target"] = val
         total += w * val
     return losses, total
@@ -355,7 +375,6 @@ def evaluate(env, policy, seeds=VAL_SEEDS):
 
 @torch.no_grad()
 def rollout_return(env, policy: PolicyNet, greedy=False, reward_clip=REWARD_CLIP, seed=None):
-    # 保留原函数（供验证与 BP 使用）
     if seed is not None:
         set_global_seed(seed)
     obs = reset_env(env, seed=seed)
@@ -378,6 +397,7 @@ def train_forward_local(env_train, env_val, policy: PolicyNet,
     用 Rademacher 扰动 + 黑盒梯度估计，但目标换为：
         J_total = w_reward * return - sum_i weight_i * local_loss_i
     注：local losses 在每条 rollout 内由激活/熵等“局部信号”计算，无需反传。
+    local_cfg=None 时退化为纯 return 最大化（不带 local loss）。
     """
     theta = get_param_vector(policy).to(device)
     train_obj, val_means = [], []
@@ -385,41 +405,76 @@ def train_forward_local(env_train, env_val, policy: PolicyNet,
 
     for up in range(1, updates + 1):
         g_est = torch.zeros_like(theta)
+        need_local = is_cfg_enabled(local_cfg)
+
         # 用 K 对扰动方向估计梯度
         for k in range(K):
-            # Rademacher {-1, +1}
             delta = torch.randint_like(theta, low=0, high=2, device=device, dtype=torch.long)
             delta = delta.float().mul_(2.0).sub_(1.0)
 
             # θ + eps
             set_param_vector(policy, theta + eps * delta)
             R_plus, logits_plus, acts_plus = rollout_metrics(
-                env_train, policy, greedy=False, seed=SEED + 220000 + up * 1000 + k, need_local=True
+                env_train, policy, greedy=False,
+                seed=SEED + 220000 + up * 1000 + k, need_local=need_local
             )
-            loss_dict_p, local_p = compute_local_losses(logits_plus, acts_plus, local_cfg)
+            _, local_p = compute_local_losses(logits_plus, acts_plus, local_cfg) if need_local else ({}, 0.0)
             J_plus = w_reward * float(R_plus) - float(local_p)
 
             # θ - eps
             set_param_vector(policy, theta - eps * delta)
             R_minus, logits_minus, acts_minus = rollout_metrics(
-                env_train, policy, greedy=False, seed=SEED + 230000 + up * 1000 + k, need_local=True
+                env_train, policy, greedy=False,
+                seed=SEED + 230000 + up * 1000 + k, need_local=need_local
             )
-            loss_dict_m, local_m = compute_local_losses(logits_minus, acts_minus, local_cfg)
+            _, local_m = compute_local_losses(logits_minus, acts_minus, local_cfg) if need_local else ({}, 0.0)
             J_minus = w_reward * float(R_minus) - float(local_m)
 
             g_est += ((J_plus - J_minus) / (2.0 * eps)) * delta
 
         g_est /= max(1, K)
-        theta = theta + lr * g_est
+
+        # ——(1) 步长规范化/裁剪：限制每次参数步长的范数
+        MAX_STEP_NORM = 1.0  # 可按需要调小，例如 0.3
+        step = lr * g_est
+        step_norm = torch.norm(step)
+        if torch.isfinite(step_norm) and step_norm > MAX_STEP_NORM:
+            step = step * (MAX_STEP_NORM / (step_norm + 1e-12))
+
+        prev_theta = theta.clone()
+        theta = theta + step
         set_param_vector(policy, theta)
+
+        # ——(2) 若参数出现非有限值，回退并衰减学习率
+        if not torch.isfinite(theta).all():
+            print("[FWD][Guard] non-finite params after update; reverting and reducing lr.")
+            theta = prev_theta
+            set_param_vector(policy, theta)
+            lr *= 0.5
+            continue
+
+        # ——(3) 评估前 logits 体检（极端数值早发现）
+        with torch.no_grad():
+            dummy_obs = np.zeros((policy.net[0].in_features,), dtype=np.float32)
+            test_logits = policy(torch.as_tensor(dummy_obs, device=device).unsqueeze(0))
+            test_logits = test_logits - torch.amax(test_logits, dim=-1, keepdim=True)
+            if not torch.isfinite(test_logits).all():
+                print("[FWD][Guard] non-finite logits detected; reverting and reducing lr.")
+                theta = prev_theta
+                set_param_vector(policy, theta)
+                lr *= 0.5
+                continue
 
         # 记录训练“目标”值（用新 θ 再 roll 一次）
         R_new, logits_new, acts_new = rollout_metrics(
-            env_train, policy, greedy=False, seed=SEED + 240000 + up, need_local=True
+            env_train, policy, greedy=False, seed=SEED + 240000 + up, need_local=need_local
         )
-        _, local_new = compute_local_losses(logits_new, acts_new, local_cfg)
+        _, local_new = compute_local_losses(logits_new, acts_new, local_cfg) if need_local else ({}, 0.0)
         J_new = w_reward * float(R_new) - float(local_new)
-        train_obj.append(J_new)
+        if not np.isfinite(J_new):
+            print("[FWD][Guard] non-finite objective; skipping record.")
+        else:
+            train_obj.append(J_new)
 
         # 用固定验证种子，纯“全局回报”的贪心评估
         val_mean, _ = evaluate(env_val, policy, seeds=VAL_SEEDS)
@@ -429,7 +484,8 @@ def train_forward_local(env_train, env_val, policy: PolicyNet,
             best_val, best_theta = val_mean, theta.clone()
 
         if up % EVAL_EVERY == 0 or up == 1:
-            print(f"[FWD] Update {up:3d} | train(obj): {J_new:7.2f} | VAL(greedy): {val_mean:6.1f}")
+            tag_local = "LocalON" if need_local else "LocalOFF"
+            print(f"[FWD-{tag_local}] Update {up:3d} | train(obj): {J_new:7.2f} | VAL(greedy): {val_mean:6.1f}")
 
     set_param_vector(policy, best_theta)
     return train_obj, val_means, best_theta
@@ -457,6 +513,8 @@ def train_backprop_reinforce(env_train, env_val, policy: PolicyNet,
             while not done:
                 obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
                 logits = policy(obs_t)
+                logits = logits - torch.amax(logits, dim=-1, keepdim=True)
+                logits = torch.nan_to_num(logits, nan=0.0, posinf=1e6, neginf=-1e6)
                 dist = torch.distributions.Categorical(logits=logits)
                 a = dist.sample()
                 logps.append(dist.log_prob(a))
@@ -510,7 +568,7 @@ def train_backprop_reinforce(env_train, env_val, policy: PolicyNet,
 # =========================
 # 实验/搜索封装
 # =========================
-def run_one_forward_trial(base_policy, env_seed_tuple, lr_fl, eps):
+def run_one_forward_trial(base_policy, env_seed_tuple, lr_fl, eps, local_cfg):
     """返回 (score, train_curve, val_curve, best_theta, policy_state_dict)"""
     env_train = make_env(ENV_ID, seed=env_seed_tuple[0])
     env_val   = make_env(ENV_ID, seed=env_seed_tuple[1])
@@ -519,7 +577,7 @@ def run_one_forward_trial(base_policy, env_seed_tuple, lr_fl, eps):
     train_obj, val_means, best_theta = train_forward_local(
         env_train, env_val, policy,
         updates=MAX_UPDATES, eps=eps, lr=lr_fl, K=K_FL,
-        local_cfg=LOCAL_LOSS_CFG, w_reward=GLOBAL_REWARD_WEIGHT
+        local_cfg=local_cfg, w_reward=GLOBAL_REWARD_WEIGHT
     )
     k = min(STEADY_K, len(val_means))
     score = float(np.mean(val_means[-k:])) if k > 0 else float(np.mean(val_means))
@@ -544,9 +602,10 @@ def run_one_bp_trial(base_policy, env_seed_tuple, lr_bp, entropy_coef):
 # 主流程：独立网格搜索 + 最优对比
 # =========================
 def main():
-    # 统一基础网络 & 评估环境种子（两侧 trial 内部环境种子固定）
-    env_seed_tuple_fwd = (SEED + 10, SEED + 20)
-    env_seed_tuple_bp  = (SEED + 11, SEED + 21)
+    # 统一基础网络 & 评估环境种子（trial 内部环境种子固定）
+    env_seed_tuple_fwd_on  = (SEED + 10, SEED + 20)
+    env_seed_tuple_fwd_off = (SEED + 12, SEED + 22)  # 与 on 略区分，避免互相污染评估
+    env_seed_tuple_bp      = (SEED + 11, SEED + 21)
 
     # 再次设置全局种子，确保 base_policy 初始化可复现
     set_global_seed(SEED)
@@ -556,39 +615,69 @@ def main():
     act_dim = tmp_env.action_space.n
     base_policy = PolicyNet(obs_dim, act_dim).to(device)
 
-    # ========== Forward(Local) Grid Search ==========
-    print("\n=== Grid Search: Forward Learning (with Local Loss) ===")
-    fwd_results = []  # 保存 (lr, eps, score, final_val_mean)
-    best_fwd = {"score": -1e9}
+    # ========== Forward(Local ON) Grid Search ==========
+    print("\n=== Grid Search: Forward Learning (Local Loss = ON) ===")
+    fwd_on_results = []  # (lr, eps, score, final_val)
+    best_fwd_on = {"score": -1e9}
 
     for lr_fl in FL_LR_GRID:
         for eps in FL_EPS_GRID:
-            print(f"\n[FWD-TRY] lr={lr_fl:.5f}, eps={eps:.5f}")
+            print(f"\n[FWD-ON TRY] lr={lr_fl:.5f}, eps={eps:.5f}")
             score, tr_curve, val_curve, best_theta, state_dict = run_one_forward_trial(
-                base_policy, env_seed_tuple_fwd, lr_fl, eps
+                base_policy, env_seed_tuple_fwd_on, lr_fl, eps, LOCAL_LOSS_CFG
             )
             final_val = float(val_curve[-1]) if len(val_curve) > 0 else float("nan")
-            fwd_results.append((lr_fl, eps, score, final_val))
+            fwd_on_results.append((lr_fl, eps, score, final_val))
 
-            if score > best_fwd["score"]:
-                best_fwd.update({
+            if score > best_fwd_on["score"]:
+                best_fwd_on.update({
                     "score": score,
                     "lr": lr_fl,
                     "eps": eps,
-                    "train_curve": tr_curve,    # 这里是 train(obj)
+                    "train_curve": tr_curve,
                     "val_curve": val_curve,
                     "best_theta": best_theta.detach().cpu(),
                     "state_dict": state_dict
                 })
-            print(f"[FWD-RESULT] score(steady-avg)={score:.2f}, final_val={final_val:.2f}")
+            print(f"[FWD-ON RESULT] score(steady-avg)={score:.2f}, final_val={final_val:.2f}")
 
-    print("\n[FWD-BEST] "
-          f"lr={best_fwd['lr']:.5f}, eps={best_fwd['eps']:.5f}, "
-          f"score={best_fwd['score']:.2f}")
+    print("\n[FWD-ON BEST] "
+          f"lr={best_fwd_on['lr']:.5f}, eps={best_fwd_on['eps']:.5f}, "
+          f"score={best_fwd_on['score']:.2f}")
+
+    # ========== Forward(Local OFF) Grid Search ==========
+    print("\n=== Grid Search: Forward Learning (Local Loss = OFF) ===")
+    fwd_off_results = []  # (lr, eps, score, final_val)
+    best_fwd_off = {"score": -1e9}
+
+    for lr_fl in FL_LR_GRID:
+        for eps in FL_EPS_GRID:
+            print(f"\n[FWD-OFF TRY] lr={lr_fl:.5f}, eps={eps:.5f}")
+            score, tr_curve, val_curve, best_theta, state_dict = run_one_forward_trial(
+                base_policy, env_seed_tuple_fwd_off, lr_fl, eps, None  # 关键：local_cfg=None
+            )
+            final_val = float(val_curve[-1]) if len(val_curve) > 0 else float("nan")
+            fwd_off_results.append((lr_fl, eps, score, final_val))
+
+            if score > best_fwd_off["score"]:
+                best_fwd_off.update({
+                    "score": score,
+                    "lr": lr_fl,
+                    "eps": eps,
+                    "train_curve": tr_curve,
+                    "val_curve": val_curve,
+                    "best_theta": best_theta.detach().cpu(),
+                    "state_dict": state_dict
+                })
+            print(f"[FWD-OFF RESULT] score(steady-avg)={score:.2f}, final_val={final_val:.2f}")
+
+    print("\n[FWD-OFF BEST] "
+          f"lr={best_fwd_off['lr']:.5f}, eps={best_fwd_off['eps']:.5f}, "
+          f"score={best_fwd_off['score']:.2f}")
 
     # ========== BP Grid Search ==========
     print("\n=== Grid Search: REINFORCE (BP) ===")
-    bp_results = []  # 保存 (lr, entropy, score, final_val_mean)
+    bp_results = []  # (lr, entropy, score, final_val)
     best_bp = {"score": -1e9}
 
     for lr_bp in BP_LR_GRID:
@@ -616,43 +705,54 @@ def main():
           f"score={best_bp['score']:.2f}")
 
     # ========== 最优模型最终评估与对比 ==========
-    env_val_fwd = make_env(ENV_ID, seed=env_seed_tuple_fwd[1])
-    env_val_bp  = make_env(ENV_ID, seed=env_seed_tuple_bp[1])
+    env_val_fwd_on  = make_env(ENV_ID, seed=env_seed_tuple_fwd_on[1])
+    env_val_fwd_off = make_env(ENV_ID, seed=env_seed_tuple_fwd_off[1])
+    env_val_bp      = make_env(ENV_ID, seed=env_seed_tuple_bp[1])
 
-    fwd_policy_best = PolicyNet(obs_dim, act_dim).to(device)
-    fwd_policy_best.load_state_dict(best_fwd["state_dict"])
+    fwd_policy_best_on = PolicyNet(obs_dim, act_dim).to(device)
+    fwd_policy_best_on.load_state_dict(best_fwd_on["state_dict"])
+    fwd_policy_best_off = PolicyNet(obs_dim, act_dim).to(device)
+    fwd_policy_best_off.load_state_dict(best_fwd_off["state_dict"])
     bp_policy_best = PolicyNet(obs_dim, act_dim).to(device)
     bp_policy_best.load_state_dict(best_bp["state_dict"])
 
-    final_fwd_mean, final_fwd_std = evaluate(env_val_fwd, fwd_policy_best, seeds=VAL_SEEDS)
-    final_bp_mean,  final_bp_std  = evaluate(env_val_bp,  bp_policy_best,  seeds=VAL_SEEDS)
+    final_fwd_on_mean,  final_fwd_on_std  = evaluate(env_val_fwd_on,  fwd_policy_best_on,  seeds=VAL_SEEDS)
+    final_fwd_off_mean, final_fwd_off_std = evaluate(env_val_fwd_off, fwd_policy_best_off, seeds=VAL_SEEDS)
+    final_bp_mean,      final_bp_std      = evaluate(env_val_bp,      bp_policy_best,      seeds=VAL_SEEDS)
 
     print("\n===== 最终评估（各自最优超参；贪心，固定验证种子） =====")
-    print(f"  Forward(Local): {final_fwd_mean:.2f} ± {final_fwd_std:.2f} "
-          f"(lr={best_fwd['lr']:.5f}, eps={best_fwd['eps']:.5f})")
-    print(f"  REINFORCE (BP): {final_bp_mean:.2f} ± {final_bp_std:.2f} "
+    print(f"  Forward(Local ON ): {final_fwd_on_mean:.2f} ± {final_fwd_on_std:.2f} "
+          f"(lr={best_fwd_on['lr']:.5f},  eps={best_fwd_on['eps']:.5f})")
+    print(f"  Forward(Local OFF): {final_fwd_off_mean:.2f} ± {final_fwd_off_std:.2f} "
+          f"(lr={best_fwd_off['lr']:.5f}, eps={best_fwd_off['eps']:.5f})")
+    print(f"  REINFORCE (BP)    : {final_bp_mean:.2f} ± {final_bp_std:.2f} "
           f"(lr={best_bp['lr']:.5g}, entropy_coef={best_bp['entropy']:.1e})")
 
     # ========== 绘图（最优曲线） ==========
-    plt.figure(figsize=(12, 5))
-    # 左：训练趋势（注意 Forward 这里画的是 train objective）
+    plt.figure(figsize=(14, 5))
+    # 左：训练趋势（Forward 这里画的是 train objective；OFF 时即为回报）
     plt.subplot(1, 2, 1)
-    xs = np.arange(1, len(best_fwd["train_curve"]) + 1)
+    xs_on = np.arange(1, len(best_fwd_on["train_curve"]) + 1)
+    xs_off = np.arange(1, len(best_fwd_off["train_curve"]) + 1)
     xb = np.arange(1, len(best_bp["train_curve"]) + 1)
-    plt.plot(xs, best_fwd["train_curve"], alpha=0.3, label="Forward train(obj)")
-    plt.plot(xs, moving_average(best_fwd["train_curve"]), label="Forward train(obj) EMA")
-    plt.plot(xb, best_bp["train_curve"], alpha=0.3, label="BP train (batch mean)")
-    plt.plot(xb, moving_average(best_bp["train_curve"]), label="BP train EMA")
+    plt.plot(xs_on,  best_fwd_on["train_curve"],  alpha=0.25, label="Forward(ON) train(obj)")
+    plt.plot(xs_on,  moving_average(best_fwd_on["train_curve"]),  label="Forward(ON) EMA")
+    plt.plot(xs_off, best_fwd_off["train_curve"], alpha=0.25, label="Forward(OFF) train(return)")
+    plt.plot(xs_off, moving_average(best_fwd_off["train_curve"]), label="Forward(OFF) EMA")
+    plt.plot(xb,     best_bp["train_curve"],      alpha=0.25, label="BP train (batch mean)")
+    plt.plot(xb,     moving_average(best_bp["train_curve"]),     label="BP train EMA")
     plt.xlabel("Update #"); plt.ylabel("Objective / Return")
     plt.title("Training metrics (trend)")
     plt.legend()
 
     # 右：对齐 post-update 验证（贪心回报）
     plt.subplot(1, 2, 2)
-    x1 = np.arange(1, len(best_fwd["val_curve"]) + 1)
-    x2 = np.arange(1, len(best_bp["val_curve"]) + 1)
-    plt.plot(x1, best_fwd["val_curve"], label="Forward VAL (greedy)")
-    plt.plot(x2, best_bp["val_curve"], label="BP VAL (greedy)")
+    x1 = np.arange(1, len(best_fwd_on["val_curve"]) + 1)
+    x2 = np.arange(1, len(best_fwd_off["val_curve"]) + 1)
+    x3 = np.arange(1, len(best_bp["val_curve"]) + 1)
+    plt.plot(x1, best_fwd_on["val_curve"],  label="Forward(ON) VAL (greedy)")
+    plt.plot(x2, best_fwd_off["val_curve"], label="Forward(OFF) VAL (greedy)")
+    plt.plot(x3, best_bp["val_curve"],      label="BP VAL (greedy)")
     plt.xlabel("Update #"); plt.ylabel("Greedy Return (fixed seeds)")
     plt.title("Aligned post-update validation (best hparams)")
     plt.legend()
@@ -665,15 +765,22 @@ def main():
 
     # ========== 保存成果 ==========
     # 模型与参数
-    torch.save(best_fwd["best_theta"], f"forward_best_theta_{tag}.pt")
-    torch.save(best_fwd["state_dict"], f"policy_forward_best_{tag}.pt")
-    torch.save(best_bp["state_dict"],   f"policy_bp_best_{tag}.pt")
+    torch.save(best_fwd_on["best_theta"],  f"forward_on_best_theta_{tag}.pt")
+    torch.save(best_fwd_on["state_dict"],  f"policy_forward_on_best_{tag}.pt")
+    torch.save(best_fwd_off["best_theta"], f"forward_off_best_theta_{tag}.pt")
+    torch.save(best_fwd_off["state_dict"], f"policy_forward_off_best_{tag}.pt")
+    torch.save(best_bp["state_dict"],      f"policy_bp_best_{tag}.pt")
 
     # 搜索结果 CSV
-    with open(f"forward_grid_{tag}.csv", "w", newline="") as f:
+    with open(f"forward_on_grid_{tag}.csv", "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["lr_forward", "eps", "score_steady_avg", "final_val"])
-        for row in fwd_results:
+        for row in fwd_on_results:
+            w.writerow(row)
+    with open(f"forward_off_grid_{tag}.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["lr_forward", "eps", "score_steady_avg", "final_val"])
+        for row in fwd_off_results:
             w.writerow(row)
     with open(f"bp_grid_{tag}.csv", "w", newline="") as f:
         w = csv.writer(f)
@@ -683,8 +790,9 @@ def main():
 
     print("\n===== 已保存文件 =====")
     print(f"  图像: {fig_path}")
-    print(f"  Forward(Local): policy_forward_best_{tag}.pt, forward_best_theta_{tag}.pt, forward_grid_{tag}.csv")
-    print(f"  BP            : policy_bp_best_{tag}.pt, bp_grid_{tag}.csv")
+    print(f"  Forward(Local ON ): policy_forward_on_best_{tag}.pt, forward_on_best_theta_{tag}.pt, forward_on_grid_{tag}.csv")
+    print(f"  Forward(Local OFF): policy_forward_off_best_{tag}.pt, forward_off_best_theta_{tag}.pt, forward_off_grid_{tag}.csv")
+    print(f"  BP                : policy_bp_best_{tag}.pt, bp_grid_{tag}.csv")
 
 if __name__ == "__main__":
     main()
