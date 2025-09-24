@@ -644,7 +644,12 @@ def train_ppo(env_train, env_val, policy: PolicyHead, value_fn: ValueNet,
         adv, rets = compute_gae(rews, vals, dones, GAMMA, GAE_LAMBDA)
 
         # 简单的训练期“采样回报”指标
-        train_returns.append(float(np.mean(rews.reshape(-1, 200).sum(-1))) if len(rews) >= 200 else float(np.sum(rews)))
+        if len(rews) >= 200:
+            n_segments = len(rews) // 200
+            segment_returns = [np.sum(rews[i*200:(i+1)*200]) for i in range(n_segments)]
+            train_returns.append(float(np.mean(segment_returns)))
+        else:
+            train_returns.append(float(np.sum(rews)))
 
         ppo_update(policy, value_fn, optim_pi, optim_v,
                    obs, act, old_logp, rets, adv,

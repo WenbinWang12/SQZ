@@ -1,4 +1,4 @@
-# fg_bp_cartpole_gridsearch_local_forward.py
+# fg_bp_cartpole_gridsearch_local_forward_landscape.py
 import os
 import math
 import csv
@@ -58,16 +58,20 @@ STEADY_K = 5                 # 评分时取尾部 K 次验证均值
 # “软对齐”搜索空间（可按需扩/缩）
 # =========================
 # —— Forward Learning（原 SPSA 的 eps / lr；我们仍然用黑盒扰动估计，但目标已包含 local loss）
-FL_LR_GRID = [0.00018, 0.00019, 0.000195, 0.0002]
-FL_EPS_GRID = [0.041, 0.042, 0.043, 0.044]
+FL_LR_GRID = [0.00017,0.000171,0.000172,0.000173,0.000174,0.000175,0.000176,0.000177,0.000178,0.000179,
+              0.00018,0.000181,0.000182,0.000183,0.000184,0.000185,0.000186,0.000187,0.000188,0.000189,
+              0.00019]
+FL_EPS_GRID = [0.042,0.0421,0.0422,0.0423,0.0424,0.0425, 
+               0.0426,0.0427,0.0428,0.0429,0.043]
 assert UPD_EPISODES >= 2, "UPD_EPISODES 必须 >= 2"
 if UPD_EPISODES % 2 != 0:
     print("[警告] 为严格对齐预算，UPD_EPISODES 应为偶数。将忽略最后 1 条轨迹。")
 K_FL = UPD_EPISODES // 2
 
 # —— REINFORCE（backprop）
-BP_LR_GRID = [0.009, 0.0095, 0.01, 0.011, 0.012]
-BP_ENTROPY_GRID = [0.0006, 0.00065, 0.0007, 0.00075, 0.0008]
+BP_LR_GRID = [0.0104, 0.0105, 0.0106, 0.0107, 0.0108, 0.0109, 0.011]
+BP_ENTROPY_GRID = [0.00055, 0.00056, 0.00057, 0.00058, 0.00059, 0.0006,
+                   0.00061, 0.00062, 0.00063, 0.00064, 0.00065]
 
 # =========================
 # Local Loss 配置（可自由开关/加权）
@@ -236,6 +240,98 @@ def set_param_vector(model: nn.Module, theta_vec: torch.Tensor):
         idx += n
 
 # =========================
+#  Loss Landscape 工具
+# =========================
+def sample_normalized_direction_like(model: nn.Module, rng: np.random.RandomState):
+    """
+    对每个参数块采样噪声并匹配该块范数，再整体归一化；返回 d，||d||_2=1
+    """
+    vecs = []
+    for p in model.parameters():
+        noise = torch.from_numpy(rng.randn(*p.data.shape)).to(dtype=p.data.dtype)
+        scale = p.data.norm().item()
+        if not np.isfinite(scale) or scale < 1e-12:
+            scale = 1.0
+        noise = noise / (noise.norm() + 1e-12) * scale
+        vecs.append(noise.reshape(-1))
+    d = torch.cat(vecs).float()
+    d = d / (d.norm() + 1e-12)
+    return d
+
+def gram_schmidt_2(d1: torch.Tensor, d2: torch.Tensor):
+    """对 (d1,d2) 做正交化并归一，返回 (u1,u2)。"""
+    u1 = d1 / (d1.norm() + 1e-12)
+    proj = torch.dot(d2, u1) * u1
+    v2 = d2 - proj
+    n2 = v2.norm()
+    if n2 < 1e-12:
+        v2 = torch.randn_like(d2)
+        v2 -= torch.dot(v2, u1) * u1
+        n2 = v2.norm()
+    u2 = v2 / (n2 + 1e-12)
+    return u1, u2
+
+@torch.no_grad()
+def greedy_return_mean(env_val, policy: PolicyNet, seeds=VAL_SEEDS):
+    m, _ = evaluate(env_val, policy, seeds=seeds)
+    return float(m)
+
+def coeff_from_theta(theta_ref: torch.Tensor, d1: torch.Tensor, d2: torch.Tensor, theta: torch.Tensor):
+    """
+    最小二乘系数 [alpha, beta] 使得 theta ≈ theta_ref + alpha*d1 + beta*d2
+    """
+    D = torch.stack([d1, d2], dim=1)   # (N,2)
+    rhs = (theta - theta_ref)
+    G = D.T @ D                         # (2,2)
+    b = D.T @ rhs                       # (2,)
+    sol = torch.linalg.solve(G, b) if torch.det(G) > 1e-12 else torch.zeros(2)
+    return float(sol[0].item()), float(sol[1].item())
+
+def make_landscape(env_val, base_policy: PolicyNet, theta_ref: torch.Tensor,
+                   d1: torch.Tensor, d2: torch.Tensor, span=1.0, grid_n=31):
+    """
+    评估 L(alpha,beta) = - greedy_return_mean(...)，返回网格 (A,B,Z)
+    """
+    alphas = np.linspace(-span, span, grid_n)
+    betas  = np.linspace(-span, span, grid_n)
+    Z = np.zeros((grid_n, grid_n), dtype=np.float32)
+
+    # 备份当前参数
+    theta_bak = get_param_vector(base_policy).detach().cpu().clone()
+
+    for i, a in enumerate(alphas):
+        for j, b in enumerate(betas):
+            theta_ij = theta_ref + a * d1 + b * d2
+            set_param_vector(base_policy, theta_ij.to(base_policy.net[0].weight.device))
+            val = greedy_return_mean(env_val, base_policy, seeds=VAL_SEEDS)
+            Z[j, i] = -val  # 负号：把“回报最大化”转成最小化的 loss
+
+    # 还原
+    set_param_vector(base_policy, theta_bak.to(base_policy.net[0].weight.device))
+    A, B = np.meshgrid(alphas, betas)
+    return A, B, Z
+
+def plot_landscape_with_trajectories(A, B, Z, trajs_ab, labels, tag_png):
+    """
+    trajs_ab: list of Nx2 的 (alpha,beta) 轨迹
+    """
+    plt.figure(figsize=(7.5, 6.5))
+    cs = plt.contourf(A, B, Z, levels=30)
+    plt.colorbar(cs, label=r"$\mathcal{L}(\alpha,\beta)=-\overline{R}_{\text{greedy}}$")
+    for (ab, lb) in zip(trajs_ab, labels):
+        ab = np.asarray(ab)
+        if ab.size == 0:
+            continue
+        plt.plot(ab[:, 0], ab[:, 1], marker='o', markersize=3, linewidth=1.5, label=lb, alpha=0.9)
+    plt.xlabel(r"$\alpha$ along $d_1$")
+    plt.ylabel(r"$\beta$ along $d_2$")
+    plt.title("CartPole Loss Landscape & Optimization Trajectories")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(tag_png, dpi=150)
+    plt.show()
+
+# =========================
 # 交互与评估 + 局部损失计算
 # =========================
 @torch.no_grad()
@@ -317,8 +413,7 @@ def _loss_slowness(acts_traces):
 def _loss_entropy_target(logits_arr, target):
     if logits_arr is None:
         return 0.0
-    # 逐行稳定的 log-sum-exp：
-    # logsumexp(x) = m + log(sum(exp(x - m))), 其中 m = max_i x_i（沿动作维）
+    # 稳定的 log-sum-exp
     logits = logits_arr.astype(np.float64, copy=False)
     m = np.max(logits, axis=-1, keepdims=True)                                  # (T,1)
     logsumexp = m + np.log(np.sum(np.exp(logits - m), axis=-1, keepdims=True))  # (T,1)
@@ -382,26 +477,29 @@ def rollout_return(env, policy: PolicyNet, greedy=False, reward_clip=REWARD_CLIP
     while not done:
         a = policy.act_greedy(obs) if greedy else policy.act_sample(obs)
         obs, r, done = step_env(env, a)
-        if reward_clip is not None:
-            r = max(min(r, reward_clip), -reward_clip)
+        if REWARD_CLIP is not None:
+            r = max(min(r, REWARD_CLIP), -REWARD_CLIP)
         total_r += r
     return total_r
 
 # =========================
-# 训练：Forward Learning（含 Local Loss 的黑盒扰动）
+# 训练：Forward Learning（含 Local Loss 的黑盒扰动） - (轨迹版)
 # =========================
 def train_forward_local(env_train, env_val, policy: PolicyNet,
                         updates=MAX_UPDATES, eps=0.02, lr=0.03, K=K_FL,
-                        local_cfg=LOCAL_LOSS_CFG, w_reward=GLOBAL_REWARD_WEIGHT):
+                        local_cfg=LOCAL_LOSS_CFG, w_reward=GLOBAL_REWARD_WEIGHT,
+                        track_thetas: bool=False):
     """
-    用 Rademacher 扰动 + 黑盒梯度估计，但目标换为：
+    用 Rademacher 扰动 + 黑盒梯度估计，目标：
         J_total = w_reward * return - sum_i weight_i * local_loss_i
-    注：local losses 在每条 rollout 内由激活/熵等“局部信号”计算，无需反传。
-    local_cfg=None 时退化为纯 return 最大化（不带 local loss）。
+    返回:
+      - train_obj, val_means, best_theta
+      - 若 track_thetas=True 还返回 theta_traj(list[Tensor])
     """
     theta = get_param_vector(policy).to(device)
     train_obj, val_means = [], []
     best_theta, best_val = theta.clone(), -1e9
+    theta_traj = [theta.detach().cpu().clone()] if track_thetas else None
 
     for up in range(1, updates + 1):
         g_est = torch.zeros_like(theta)
@@ -483,22 +581,28 @@ def train_forward_local(env_train, env_val, policy: PolicyNet,
         if val_mean > best_val:
             best_val, best_theta = val_mean, theta.clone()
 
+        if track_thetas:
+            theta_traj.append(theta.detach().cpu().clone())
+
         if up % EVAL_EVERY == 0 or up == 1:
             tag_local = "LocalON" if need_local else "LocalOFF"
             print(f"[FWD-{tag_local}] Update {up:3d} | train(obj): {J_new:7.2f} | VAL(greedy): {val_mean:6.1f}")
 
     set_param_vector(policy, best_theta)
-    return train_obj, val_means, best_theta
+    return (train_obj, val_means, best_theta) if not track_thetas else (train_obj, val_means, best_theta, theta_traj)
 
 # =========================
-# 训练：REINFORCE（backprop）
+# 训练：REINFORCE（backprop） - (轨迹版)
 # =========================
 def train_backprop_reinforce(env_train, env_val, policy: PolicyNet,
                              updates=MAX_UPDATES, batch_episodes=UPD_EPISODES,
-                             lr=3e-3, gamma=GAMMA, entropy_coef=0.0):
+                             lr=3e-3, gamma=GAMMA, entropy_coef=0.0,
+                             track_thetas: bool=False):
     optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
     train_returns, val_means = [], []
     best_state, best_val = copy.deepcopy(policy.state_dict()), -1e9
+
+    theta_traj = [get_param_vector(policy).detach().cpu().clone()] if track_thetas else None
     ep_counter = 0
 
     for up in range(1, updates + 1):
@@ -538,7 +642,6 @@ def train_backprop_reinforce(env_train, env_val, policy: PolicyNet,
         logps_cat = torch.cat(batch_logps)
         adv_cat = torch.cat(batch_adv)
         ent_cat = torch.cat(batch_ent)
-
         if adv_cat.numel() > 1:
             adv_cat = (adv_cat - adv_cat.mean()) / (adv_cat.std() + 1e-8)
 
@@ -559,47 +662,64 @@ def train_backprop_reinforce(env_train, env_val, policy: PolicyNet,
         if val_mean > best_val:
             best_val, best_state = val_mean, copy.deepcopy(policy.state_dict())
 
+        if track_thetas:
+            theta_traj.append(get_param_vector(policy).detach().cpu().clone())
+
         if up % EVAL_EVERY == 0 or up == 1:
             print(f"[BP]   Update {up:3d} | batch_mean_return: {np.mean(batch_returns):6.1f} | VAL(greedy): {val_mean:6.1f}")
 
     policy.load_state_dict(best_state)
-    return train_returns, val_means
+    return (train_returns, val_means) if not track_thetas else (train_returns, val_means, theta_traj)
 
 # =========================
-# 实验/搜索封装
+# 实验/搜索封装（轨迹版）
 # =========================
-def run_one_forward_trial(base_policy, env_seed_tuple, lr_fl, eps, local_cfg):
-    """返回 (score, train_curve, val_curve, best_theta, policy_state_dict)"""
+def run_one_forward_trial(base_policy, env_seed_tuple, lr_fl, eps, local_cfg, track_thetas: bool=True):
+    """返回 (score, train_curve, val_curve, best_theta, policy_state_dict, theta_traj)"""
     env_train = make_env(ENV_ID, seed=env_seed_tuple[0])
     env_val   = make_env(ENV_ID, seed=env_seed_tuple[1])
 
     policy = copy.deepcopy(base_policy).to(device)
-    train_obj, val_means, best_theta = train_forward_local(
+    out = train_forward_local(
         env_train, env_val, policy,
         updates=MAX_UPDATES, eps=eps, lr=lr_fl, K=K_FL,
-        local_cfg=local_cfg, w_reward=GLOBAL_REWARD_WEIGHT
+        local_cfg=local_cfg, w_reward=GLOBAL_REWARD_WEIGHT,
+        track_thetas=track_thetas
     )
+    if track_thetas:
+        train_obj, val_means, best_theta, theta_traj = out
+    else:
+        train_obj, val_means, best_theta = out
+        theta_traj = None
+
     k = min(STEADY_K, len(val_means))
     score = float(np.mean(val_means[-k:])) if k > 0 else float(np.mean(val_means))
-    return score, train_obj, val_means, best_theta, copy.deepcopy(policy.state_dict())
+    return score, train_obj, val_means, best_theta, copy.deepcopy(policy.state_dict()), theta_traj
 
-def run_one_bp_trial(base_policy, env_seed_tuple, lr_bp, entropy_coef):
-    """返回 (score, train_curve, val_curve, policy_state_dict)"""
+def run_one_bp_trial(base_policy, env_seed_tuple, lr_bp, entropy_coef, track_thetas: bool=True):
+    """返回 (score, train_curve, val_curve, policy_state_dict, theta_traj)"""
     env_train = make_env(ENV_ID, seed=env_seed_tuple[0])
     env_val   = make_env(ENV_ID, seed=env_seed_tuple[1])
 
     policy = copy.deepcopy(base_policy).to(device)
-    train_ret, val_means = train_backprop_reinforce(
+    out = train_backprop_reinforce(
         env_train, env_val, policy,
         updates=MAX_UPDATES, batch_episodes=UPD_EPISODES,
-        lr=lr_bp, gamma=GAMMA, entropy_coef=entropy_coef
+        lr=lr_bp, gamma=GAMMA, entropy_coef=entropy_coef,
+        track_thetas=track_thetas
     )
+    if track_thetas:
+        train_ret, val_means, theta_traj = out
+    else:
+        train_ret, val_means = out
+        theta_traj = None
+
     k = min(STEADY_K, len(val_means))
     score = float(np.mean(val_means[-k:])) if k > 0 else float(np.mean(val_means))
-    return score, train_ret, val_means, copy.deepcopy(policy.state_dict())
+    return score, train_ret, val_means, copy.deepcopy(policy.state_dict()), theta_traj
 
 # =========================
-# 主流程：独立网格搜索 + 最优对比
+# 主流程：独立网格搜索 + 最优对比 + Landscape
 # =========================
 def main():
     # 统一基础网络 & 评估环境种子（trial 内部环境种子固定）
@@ -614,6 +734,7 @@ def main():
     obs_dim = tmp_env.observation_space.shape[0]
     act_dim = tmp_env.action_space.n
     base_policy = PolicyNet(obs_dim, act_dim).to(device)
+    base_theta0 = get_param_vector(base_policy).detach().cpu().clone()
 
     # ========== Forward(Local ON) Grid Search ==========
     print("\n=== Grid Search: Forward Learning (Local Loss = ON) ===")
@@ -623,8 +744,8 @@ def main():
     for lr_fl in FL_LR_GRID:
         for eps in FL_EPS_GRID:
             print(f"\n[FWD-ON TRY] lr={lr_fl:.5f}, eps={eps:.5f}")
-            score, tr_curve, val_curve, best_theta, state_dict = run_one_forward_trial(
-                base_policy, env_seed_tuple_fwd_on, lr_fl, eps, LOCAL_LOSS_CFG
+            score, tr_curve, val_curve, best_theta, state_dict, theta_traj = run_one_forward_trial(
+                base_policy, env_seed_tuple_fwd_on, lr_fl, eps, LOCAL_LOSS_CFG, track_thetas=True
             )
             final_val = float(val_curve[-1]) if len(val_curve) > 0 else float("nan")
             fwd_on_results.append((lr_fl, eps, score, final_val))
@@ -637,7 +758,8 @@ def main():
                     "train_curve": tr_curve,
                     "val_curve": val_curve,
                     "best_theta": best_theta.detach().cpu(),
-                    "state_dict": state_dict
+                    "state_dict": state_dict,
+                    "theta_traj": theta_traj
                 })
             print(f"[FWD-ON RESULT] score(steady-avg)={score:.2f}, final_val={final_val:.2f}")
 
@@ -653,8 +775,8 @@ def main():
     for lr_fl in FL_LR_GRID:
         for eps in FL_EPS_GRID:
             print(f"\n[FWD-OFF TRY] lr={lr_fl:.5f}, eps={eps:.5f}")
-            score, tr_curve, val_curve, best_theta, state_dict = run_one_forward_trial(
-                base_policy, env_seed_tuple_fwd_off, lr_fl, eps, None  # 关键：local_cfg=None
+            score, tr_curve, val_curve, best_theta, state_dict, theta_traj = run_one_forward_trial(
+                base_policy, env_seed_tuple_fwd_off, lr_fl, eps, None, track_thetas=True  # 关键：local_cfg=None
             )
             final_val = float(val_curve[-1]) if len(val_curve) > 0 else float("nan")
             fwd_off_results.append((lr_fl, eps, score, final_val))
@@ -667,7 +789,8 @@ def main():
                     "train_curve": tr_curve,
                     "val_curve": val_curve,
                     "best_theta": best_theta.detach().cpu(),
-                    "state_dict": state_dict
+                    "state_dict": state_dict,
+                    "theta_traj": theta_traj
                 })
             print(f"[FWD-OFF RESULT] score(steady-avg)={score:.2f}, final_val={final_val:.2f}")
 
@@ -683,8 +806,8 @@ def main():
     for lr_bp in BP_LR_GRID:
         for entc in BP_ENTROPY_GRID:
             print(f"\n[BP-TRY] lr={lr_bp:.5g}, entropy_coef={entc:.1e}")
-            score, tr_curve, val_curve, state_dict = run_one_bp_trial(
-                base_policy, env_seed_tuple_bp, lr_bp, entc
+            score, tr_curve, val_curve, state_dict, theta_traj = run_one_bp_trial(
+                base_policy, env_seed_tuple_bp, lr_bp, entc, track_thetas=True
             )
             final_val = float(val_curve[-1]) if len(val_curve) > 0 else float("nan")
             bp_results.append((lr_bp, entc, score, final_val))
@@ -696,7 +819,8 @@ def main():
                     "entropy": entc,
                     "train_curve": tr_curve,
                     "val_curve": val_curve,
-                    "state_dict": state_dict
+                    "state_dict": state_dict,
+                    "theta_traj": theta_traj
                 })
             print(f"[BP-RESULT] score(steady-avg)={score:.2f}, final_val={final_val:.2f}")
 
@@ -763,6 +887,47 @@ def main():
     plt.savefig(fig_path, dpi=150)
     plt.show()
 
+    # ====== Loss landscape & trajectories ======
+    # 统一使用：参考点 theta_ref = base_theta0（初始化点）。也可改为某法的 best。
+    theta_ref = base_theta0.clone()
+
+    # 在 base_policy 的几何上采样两个方向，并做正交化
+    rng = np.random.RandomState(SEED + 777)
+    d1_raw = sample_normalized_direction_like(base_policy, rng)
+    d2_raw = sample_normalized_direction_like(base_policy, rng)
+    d1, d2 = gram_schmidt_2(d1_raw, d2_raw)
+
+    # 验证环境（用于 landscape 评估）
+    env_val_land = make_env(ENV_ID, seed=SEED + 333)
+
+    # 临时策略（避免污染 best）
+    tmp_policy = PolicyNet(obs_dim, act_dim).to(device)
+    set_param_vector(tmp_policy, theta_ref.to(device))
+
+    # 评估网格：把“回报最大化”转为 loss = -return
+    A, B, Z = make_landscape(env_val_land, tmp_policy, theta_ref.to(device), d1.to(device), d2.to(device),
+                             span=1.0, grid_n=31)
+
+    # 轨迹投影到 (alpha, beta)
+    def project_traj(thetas):
+        ab = []
+        for th in thetas:
+            a, b = coeff_from_theta(theta_ref, d1, d2, th)
+            ab.append((a, b))
+        return np.array(ab, dtype=np.float32)
+
+    traj_on   = project_traj([t.cpu() for t in best_fwd_on.get("theta_traj", [])])   if "theta_traj" in best_fwd_on   else np.zeros((0,2))
+    traj_off  = project_traj([t.cpu() for t in best_fwd_off.get("theta_traj", [])])  if "theta_traj" in best_fwd_off  else np.zeros((0,2))
+    traj_bp   = project_traj([t.cpu() for t in best_bp.get("theta_traj", [])])       if "theta_traj" in best_bp       else np.zeros((0,2))
+
+    land_png = f"loss_landscape_{tag}.png"
+    plot_landscape_with_trajectories(A, B, Z,
+        trajs_ab=[traj_on, traj_off, traj_bp],
+        labels=["Forward (Local ON)", "Forward (Local OFF)", "REINFORCE (BP)"],
+        tag_png=land_png
+    )
+    print(f"[Landscape] Saved: {land_png}")
+
     # ========== 保存成果 ==========
     # 模型与参数
     torch.save(best_fwd_on["best_theta"],  f"forward_on_best_theta_{tag}.pt")
@@ -790,6 +955,7 @@ def main():
 
     print("\n===== 已保存文件 =====")
     print(f"  图像: {fig_path}")
+    print(f"  Landscape: {land_png}")
     print(f"  Forward(Local ON ): policy_forward_on_best_{tag}.pt, forward_on_best_theta_{tag}.pt, forward_on_grid_{tag}.csv")
     print(f"  Forward(Local OFF): policy_forward_off_best_{tag}.pt, forward_off_best_theta_{tag}.pt, forward_off_grid_{tag}.csv")
     print(f"  BP                : policy_bp_best_{tag}.pt, bp_grid_{tag}.csv")
