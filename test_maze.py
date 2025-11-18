@@ -1249,8 +1249,8 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     random.seed(0)
 
-    num_epochs = 20             # 可以按需改小/改大
-    LR_LIST = [0.001, 0.003, 0.01, 0.03]
+    num_epochs = 1000             # 可以按需改小/改大
+    LR_LIST = [0.001, 0.003, 0.005, 0.007, 0.01, 0.03, 0.05, 0.07, 0.1, 0.3, 0.5, 0.7, 1, 3, 5, 7, 10]
 
     # 架构列表：CNN + Transformer + Mambo-style + Linear Attention
     ARCH_LIST = [
@@ -1355,14 +1355,15 @@ if __name__ == "__main__":
                 plot_same_opt_epoch_curve(best_metrics, log_dir)
 
         # 3) 固定一个 lr，比不同优化器的 val_acc
-        lr_ref = LR_LIST[2]  # 比如选 0.01
-        plot_diff_opt_same_lr(results, arch_name, optimizers_to_test, lr_ref, log_dir)
+        for lr_ref in LR_LIST:
+            plot_diff_opt_same_lr(results, arch_name, optimizers_to_test, lr_ref, log_dir)
 
         # 4) 不同优化器“最佳 lr”的 maze_success 对比
         plot_best_maze_success(results, arch_name, optimizers_to_test, LR_LIST, log_dir)
 
         # 5) 固定一个 lr，比不同优化器的训练时间
-        plot_time_diff_opt_same_lr(results, arch_name, optimizers_to_test, lr_ref, log_dir)
+        for lr_ref in LR_LIST:
+            plot_time_diff_opt_same_lr(results, arch_name, optimizers_to_test, lr_ref, log_dir)
 
     # 保存结果 + 代码
     log_path = os.path.join(log_dir, 'log_maze_compare_arch_optim_all_linear.pt')
