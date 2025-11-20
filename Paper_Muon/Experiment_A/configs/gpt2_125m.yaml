@@ -1,0 +1,49 @@
+# -------------------------
+# GPT-2 125M scale experiment config for A-LS-Muon paper
+# -------------------------
+
+exp_name: gpt2_125m_als_muon_test
+output_dir: results
+
+# --- Dataset & Tokenizer ---
+dataset_name: wikitext
+dataset_config: wikitext-2-raw-v1
+tokenizer_name: gpt2
+local_tokenizer_path: ./local_gpt2_tokenizer
+vocab_size: 50257
+num_workers: 4
+
+# --- Model Architecture (GPT-2 Small) ---
+n_layer: 12
+n_embd: 768
+n_head: 12
+seq_len: 1024
+
+# --- Training Loop ---
+total_steps: 2000
+epochs: 3
+batch_size: 8
+gradient_accumulation_steps: 16
+
+# --- Logging ---
+log_interval: 10        
+
+# --- Optimizer Common ---
+optimizers: ["AdamW", "Muon", "A-LS-Muon"]
+weight_decay: 0.1       # 预训练标准 WD
+momentum: 0.95          # Muon 需要 Momentum
+
+# --- Learning Rates ---
+lr: 0.0006              # AdamW 的标准 GPT-2 LR
+muon_lr: 0.02           # Muon 需要极大的 LR (通常 0.02 - 0.05)
+
+# --- Muon Specifics ---
+ns_steps: 5             # 提高 NS 迭代次数以保证正交性 
+
+# --- A-LS-Muon Specifics (Crucial for Proposal) ---
+muon_B: 16              # GPT-2 Small 约有 70+ 个矩阵，选 Top 16 (约20%)
+refresh_interval: 50    # 每 50 步重新计算一次分数，大幅降低开销
+epsilon: 0.1            # 10% 的概率随机选择层，保证理论收敛性
+
+
+

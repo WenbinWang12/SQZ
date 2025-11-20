@@ -911,7 +911,7 @@ def make_optimizers(model, optimizer_name, lr, wd_effective=1e-4):
     - 'shampoo'   ：简化版 Shampoo。
     """
     params_all = [p for p in model.parameters() if p.requires_grad]
-    filter_params = [p for p in params_all if p.ndim == 4]
+    filter_params = [p for p in params_all if p.ndim == 4]  # 选择卷积层参数
     other_params = [p for p in params_all if p.ndim != 4]
 
     optimizers = []
@@ -951,17 +951,23 @@ def make_optimizers(model, optimizer_name, lr, wd_effective=1e-4):
         desc = f"Lion(lr={lr}, betas=(0.9,0.99))"
 
     elif optimizer_name == "muon":
-        # Conv filter: Muon；其他：SGD
-        muon_lr = lr * 4.0  # 给 Muon 略大步长
-        opt_sgd = torch.optim.SGD(other_params, lr=lr, momentum=0.9, nesterov=True,
-                                  weight_decay=wd_effective)
-        opt_muon = Muon(filter_params, lr=muon_lr, momentum=0.6, nesterov=True)
-        optimizers = [opt_sgd, opt_muon]
-        desc = f"Muon(conv filters, lr={muon_lr}) + SGD(others, lr={lr})"
+        # 仅当 filter_params 不为空时才创建 Muon 优化器
+        if len(filter_params) > 0:
+            muon_lr = lr * 4.0  # 给 Muon 略大步长
+            opt_sgd = torch.optim.SGD(other_params, lr=lr, momentum=0.9, nesterov=True,
+                                      weight_decay=wd_effective)
+            opt_muon = Muon(filter_params, lr=muon_lr, momentum=0.6, nesterov=True)
+            optimizers = [opt_sgd, opt_muon]
+            desc = f"Muon(conv filters, lr={muon_lr}) + SGD(others, lr={lr})"
+        else:
+            # 如果没有卷积层，则只使用普通优化器
+            opt_sgd = torch.optim.SGD(params_all, lr=lr, momentum=0.9, nesterov=True,
+                                       weight_decay=wd_effective)
+            optimizers = [opt_sgd]
+            desc = f"SGD(momentum=0.9, nesterov=True, lr={lr}) (no conv filters)"
 
     elif optimizer_name == "muon_adamw":
         # Conv filter: Muon；其他：AdamW
-        muon_lr = lr * 4.0
         if len(filter_params) == 0:
             # 没有 Conv filter，就退化成纯 AdamW
             opt = torch.optim.AdamW(params_all, lr=lr, weight_decay=wd_effective)
@@ -969,6 +975,7 @@ def make_optimizers(model, optimizer_name, lr, wd_effective=1e-4):
             desc = (f"AdamW(lr={lr}, weight_decay={wd_effective}) "
                     f"(no conv filters, Muon unused)")
         else:
+            muon_lr = lr * 4.0
             opt_adamw = torch.optim.AdamW(other_params, lr=lr, weight_decay=wd_effective)
             opt_muon = Muon(filter_params, lr=muon_lr, momentum=0.6, nesterov=True)
             optimizers = [opt_adamw, opt_muon]

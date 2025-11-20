@@ -1,0 +1,4 @@
+optimizer,tokens_processed,final_loss,total_time_sec,avg_step_time_ms,peak_grad_norm
+AdamW,16384000,0.463,923.32,35.3,362.32
+Muon,16384000,1.15,1214.56,564.7,193.08
+A-LS-Muon,16384000,0.8279,1065.11,425.3,176.73
